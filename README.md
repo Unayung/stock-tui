@@ -49,6 +49,16 @@ cargo install --path .
 stock-tui
 ```
 
+### Demo Mode
+
+Run with sample portfolio data (no configuration needed):
+
+```bash
+DEMO=true stock-tui
+```
+
+This loads `demo.conf` with sample TW and US stocks for testing.
+
 ### Keyboard Shortcuts
 
 | Key | Action |

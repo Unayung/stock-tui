@@ -153,6 +153,10 @@ impl App {
         Ok(app)
     }
 
+    fn is_demo_mode() -> bool {
+        std::env::var("DEMO").map(|v| v == "true" || v == "1").unwrap_or(false)
+    }
+
     fn portfolios_dir() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_default()
@@ -164,6 +168,23 @@ impl App {
     }
 
     fn load_portfolios(&mut self) -> Result<()> {
+        // Demo mode: load from demo.conf in current directory or next to executable
+        if Self::is_demo_mode() {
+            let demo_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.join("demo.conf")))
+                .filter(|p| p.exists())
+                .unwrap_or_else(|| PathBuf::from("demo.conf"));
+
+            if demo_path.exists() {
+                self.portfolios = vec![Portfolio {
+                    name: "demo".to_string(),
+                    file_path: demo_path,
+                }];
+                return Ok(());
+            }
+        }
+
         let dir = Self::portfolios_dir();
         fs::create_dir_all(&dir)?;
 
