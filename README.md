@@ -33,7 +33,7 @@ cd stock-tui
 cargo build --release
 ```
 
-The binary will be at `target/release/stock_tui`.
+The binary will be at `target/release/stock-tui`.
 
 ### Using cargo
 
@@ -44,7 +44,7 @@ cargo install --path .
 ## Usage
 
 ```bash
-stock_tui
+stock-tui
 ```
 
 ### Keyboard Shortcuts
