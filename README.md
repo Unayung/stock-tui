@@ -6,6 +6,8 @@ A terminal-based stock portfolio tracker with real-time price data from Yahoo Fi
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue)
 
+![Demo](demo.jpg)
+
 ## Features
 
 - Real-time stock prices from Yahoo Finance
