@@ -9,8 +9,9 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
+    symbols,
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs},
+    widgets::{Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table, TableState, Tabs},
     Frame, Terminal,
 };
 use std::{
@@ -22,6 +23,7 @@ use std::{
 };
 
 const CACHE_DURATION_SECS: u64 = 60;
+const HISTORICAL_CACHE_DURATION_SECS: u64 = 6 * 60 * 60; // 6 hours for historical data
 
 #[derive(Clone, Debug)]
 struct Stock {
@@ -31,6 +33,7 @@ struct Stock {
     quantity: f64,
     cost_basis: f64,
     price_data: Option<PriceData>,
+    historical: Option<HistoricalData>,
     portfolio_name: String,
 }
 
@@ -40,6 +43,14 @@ struct PriceData {
     #[allow(dead_code)]
     change: f64, // Kept for potential future use (e.g., displaying absolute change)
     change_percent: f64,
+}
+
+#[derive(Clone, Debug)]
+struct HistoricalData {
+    #[allow(dead_code)]
+    timestamps: Vec<i64>, // Kept for potential future use (e.g., date labels)
+    closes: Vec<f64>,
+    last_fetched: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +81,7 @@ enum InputMode {
     EditStock(EditStockState),
     DeleteConfirm(String),
     NewPortfolio(String),
+    DetailView(String), // Symbol being viewed in detail
 }
 
 #[derive(Debug, Default)]
@@ -106,6 +118,7 @@ struct App {
     last_update: Instant,
     input_mode: InputMode,
     cache: HashMap<String, (PriceData, Instant)>,
+    historical_cache: HashMap<String, HistoricalData>,
     sort_column: Option<SortColumn>,
     sort_direction: SortDirection,
     hide_positions: bool, // Toggle with 'h' to hide cost/quantity/gain for privacy
@@ -130,6 +143,7 @@ impl App {
             last_update: Instant::now(),
             input_mode: InputMode::Normal,
             cache: HashMap::new(),
+            historical_cache: HashMap::new(),
             sort_column: Some(SortColumn::Change), // Default sort by change %
             sort_direction: SortDirection::Descending,
             hide_positions: false,
@@ -214,6 +228,7 @@ impl App {
                     quantity: parts.get(3).and_then(|s| s.trim().parse().ok()).unwrap_or(0.0),
                     cost_basis: parts.get(4).and_then(|s| s.trim().parse().ok()).unwrap_or(0.0),
                     price_data: None,
+                    historical: None,
                     portfolio_name: String::new(),
                 });
             }
@@ -335,10 +350,117 @@ impl App {
         }
     }
 
+    fn fetch_historical(&mut self, symbol: &str) -> Option<HistoricalData> {
+        // Check in-memory cache first
+        if let Some(data) = self.historical_cache.get(symbol) {
+            if data.last_fetched.elapsed().as_secs() < HISTORICAL_CACHE_DURATION_SECS {
+                return Some(data.clone());
+            }
+        }
+
+        // Try file cache
+        fs::create_dir_all(Self::cache_dir()).ok();
+        let cache_file = Self::cache_dir().join(format!("{}_history.json", symbol.replace('.', "_")));
+
+        if let Ok(metadata) = fs::metadata(&cache_file) {
+            if let Ok(modified) = metadata.modified() {
+                if modified.elapsed().map(|d| d.as_secs() < HISTORICAL_CACHE_DURATION_SECS).unwrap_or(false) {
+                    if let Ok(content) = fs::read_to_string(&cache_file) {
+                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+                            let timestamps: Vec<i64> = data["timestamps"]
+                                .as_array()
+                                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+                                .unwrap_or_default();
+                            let closes: Vec<f64> = data["closes"]
+                                .as_array()
+                                .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+                                .unwrap_or_default();
+
+                            if !timestamps.is_empty() && !closes.is_empty() {
+                                let historical = HistoricalData {
+                                    timestamps,
+                                    closes,
+                                    last_fetched: Instant::now(),
+                                };
+                                self.historical_cache.insert(symbol.to_string(), historical.clone());
+                                return Some(historical);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fetch from Yahoo Finance API
+        let url = format!(
+            "https://query2.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=1mo",
+            symbol
+        );
+
+        if let Ok(response) = reqwest::blocking::Client::new()
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+            .timeout(Duration::from_secs(10))
+            .send()
+        {
+            if let Ok(data) = response.json::<serde_json::Value>() {
+                if let Some(result) = data["chart"]["result"].get(0) {
+                    let timestamps: Vec<i64> = result["timestamp"]
+                        .as_array()
+                        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+                        .unwrap_or_default();
+
+                    let closes: Vec<f64> = result["indicators"]["quote"][0]["close"]
+                        .as_array()
+                        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+                        .unwrap_or_default();
+
+                    if !timestamps.is_empty() && !closes.is_empty() {
+                        // Save to file cache
+                        let cache_json = serde_json::json!({
+                            "timestamps": timestamps,
+                            "closes": closes
+                        });
+                        let _ = fs::write(&cache_file, cache_json.to_string());
+
+                        let historical = HistoricalData {
+                            timestamps,
+                            closes,
+                            last_fetched: Instant::now(),
+                        };
+                        self.historical_cache.insert(symbol.to_string(), historical.clone());
+                        return Some(historical);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Calculate trend from historical data: compare first 5 days avg vs last 5 days avg
+    fn calculate_trend(closes: &[f64]) -> (&'static str, Color) {
+        if closes.len() < 10 {
+            return ("→", Color::Gray);
+        }
+
+        let first_avg: f64 = closes.iter().take(5).sum::<f64>() / 5.0;
+        let last_avg: f64 = closes.iter().rev().take(5).sum::<f64>() / 5.0;
+        let change_pct = ((last_avg - first_avg) / first_avg) * 100.0;
+
+        if change_pct > 1.0 {
+            ("⬆", Color::Green)
+        } else if change_pct < -1.0 {
+            ("⬇", Color::Red)
+        } else {
+            ("→", Color::Gray)
+        }
+    }
+
     fn refresh_data(&mut self) -> Result<()> {
         self.usd_twd_rate = self.fetch_exchange_rate();
 
-        // Load current portfolio stocks
+        // Load current portfolio stocks with prices
         let (file_path, portfolio_name) = if let Some(portfolio) = self.portfolios.get(self.current_portfolio_idx) {
             (portfolio.file_path.clone(), portfolio.name.clone())
         } else {
@@ -356,7 +478,7 @@ impl App {
         self.tw_stocks = self.stocks.iter().filter(|s| s.symbol.contains(".TW")).cloned().collect();
         self.us_stocks = self.stocks.iter().filter(|s| !s.symbol.contains(".TW")).cloned().collect();
 
-        // Load combined stocks (aggregated) - sort_stocks() is called inside
+        // Load combined stocks (aggregated)
         self.load_combined_stocks()?;
 
         self.last_update = Instant::now();
@@ -396,6 +518,7 @@ impl App {
             }
         }
 
+        // Fetch prices for combined stocks
         self.combined_stocks = aggregated
             .into_iter()
             .map(|(symbol, mut stock)| {
@@ -409,7 +532,6 @@ impl App {
                 stock
             })
             .collect();
-
         self.combined_tw_stocks = self.combined_stocks.iter().filter(|s| s.symbol.contains(".TW")).cloned().collect();
         self.combined_us_stocks = self.combined_stocks.iter().filter(|s| !s.symbol.contains(".TW")).cloned().collect();
 
@@ -611,6 +733,7 @@ impl App {
                 quantity,
                 cost_basis,
                 price_data: None,
+                historical: None,
                 portfolio_name: portfolio.name.clone(),
             });
             self.save_stocks(&portfolio.name, &stocks)?;
@@ -719,6 +842,7 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                     }
                     Action::Refresh => {
                         app.cache.clear();
+                        app.historical_cache.clear();
                         app.refresh_data()?;
                     }
                     Action::SwitchPortfolio(idx) => {
@@ -822,6 +946,57 @@ fn handle_input(app: &mut App, key: KeyCode) -> Action {
             // Toggle hide positions for privacy
             KeyCode::Char('H') => {
                 app.hide_positions = !app.hide_positions;
+                Action::None
+            }
+            // Enter to view stock detail - fetch historical on demand
+            KeyCode::Enter => {
+                if let Some(stock) = app.get_selected_stock() {
+                    let symbol = stock.symbol.clone();
+
+                    // Fetch historical on-demand for chart
+                    let historical = app.fetch_historical(&symbol);
+
+                    // Update the stock's historical data in all vectors
+                    for s in app.stocks.iter_mut() {
+                        if s.symbol == symbol {
+                            s.historical = historical.clone();
+                        }
+                    }
+                    for s in app.tw_stocks.iter_mut() {
+                        if s.symbol == symbol {
+                            s.historical = historical.clone();
+                        }
+                    }
+                    for s in app.us_stocks.iter_mut() {
+                        if s.symbol == symbol {
+                            s.historical = historical.clone();
+                        }
+                    }
+                    for s in app.combined_stocks.iter_mut() {
+                        if s.symbol == symbol {
+                            s.historical = historical.clone();
+                        }
+                    }
+                    for s in app.combined_tw_stocks.iter_mut() {
+                        if s.symbol == symbol {
+                            s.historical = historical.clone();
+                        }
+                    }
+                    for s in app.combined_us_stocks.iter_mut() {
+                        if s.symbol == symbol {
+                            s.historical = historical.clone();
+                        }
+                    }
+
+                    app.input_mode = InputMode::DetailView(symbol);
+                }
+                Action::None
+            }
+            _ => Action::None,
+        },
+        InputMode::DetailView(_) => match key {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                app.input_mode = InputMode::Normal;
                 Action::None
             }
             _ => Action::None,
@@ -956,6 +1131,7 @@ fn ui(f: &mut Frame, app: &App) {
         InputMode::EditStock(state) => render_edit_dialog(f, state),
         InputMode::DeleteConfirm(symbol) => render_delete_dialog(f, symbol),
         InputMode::NewPortfolio(name) => render_new_portfolio_dialog(f, name),
+        InputMode::DetailView(symbol) => render_detail_view(f, app, symbol),
         InputMode::Normal => {}
     }
 }
@@ -1076,12 +1252,11 @@ fn render_stock_tables(f: &mut Frame, app: &App, area: Rect) {
 
 fn get_widths(combined: bool, hide_positions: bool) -> Vec<Constraint> {
     if hide_positions {
-        // Minimal columns: Symbol, Name, Price, Change, (Portfolio if combined)
         let mut widths = vec![
             Constraint::Length(10),  // Symbol
-            Constraint::Length(20),  // Name (wider when fewer columns)
+            Constraint::Length(16),  // Name
             Constraint::Length(12),  // Price
-            Constraint::Length(12),  // Change
+            Constraint::Length(10),  // Change
         ];
         if combined {
             widths.push(Constraint::Length(12));  // Portfolio
@@ -1089,26 +1264,26 @@ fn get_widths(combined: bool, hide_positions: bool) -> Vec<Constraint> {
         widths
     } else if combined {
         vec![
-            Constraint::Length(10),  // Symbol
-            Constraint::Length(12),  // Name
-            Constraint::Length(12),  // Price
-            Constraint::Length(10),  // Change
-            Constraint::Length(10),  // Qty
-            Constraint::Length(10),  // Cost
-            Constraint::Length(14),  // Gain
-            Constraint::Length(10),  // Gain %
-            Constraint::Length(12),  // Portfolio
+            Constraint::Length(8),   // Symbol
+            Constraint::Length(10),  // Name
+            Constraint::Length(10),  // Price
+            Constraint::Length(9),   // Change
+            Constraint::Length(8),   // Qty
+            Constraint::Length(8),   // Cost
+            Constraint::Length(12),  // Gain
+            Constraint::Length(8),   // Gain %
+            Constraint::Length(10),  // Portfolio
         ]
     } else {
         vec![
-            Constraint::Length(10),  // Symbol
-            Constraint::Length(14),  // Name
-            Constraint::Length(12),  // Price
-            Constraint::Length(10),  // Change
-            Constraint::Length(10),  // Qty
-            Constraint::Length(10),  // Cost
-            Constraint::Length(14),  // Gain
-            Constraint::Length(10),  // Gain %
+            Constraint::Length(8),   // Symbol
+            Constraint::Length(12),  // Name
+            Constraint::Length(10),  // Price
+            Constraint::Length(9),   // Change
+            Constraint::Length(8),   // Qty
+            Constraint::Length(8),   // Cost
+            Constraint::Length(12),  // Gain
+            Constraint::Length(8),   // Gain %
         ]
     }
 }
@@ -1123,9 +1298,9 @@ fn stock_to_row(stock: &Stock, usd_twd_rate: f64, show_portfolio: bool, hide_pos
 
     let mut cells = vec![
         Cell::from(stock.display.clone()),
-        Cell::from(if show_portfolio { stock.name.chars().take(10).collect::<String>() } else { stock.name.clone() }),
+        Cell::from(if show_portfolio { stock.name.chars().take(8).collect::<String>() } else { stock.name.chars().take(10).collect::<String>() }),
         Cell::from(Line::from(format!("{:.2}", price)).alignment(Alignment::Right)).style(Style::default().fg(color)),
-        Cell::from(Line::from(format!("{}{:.2}%", arrow, change_pct)).alignment(Alignment::Right)).style(Style::default().fg(color)),
+        Cell::from(Line::from(format!("{}{:.1}%", arrow, change_pct)).alignment(Alignment::Right)).style(Style::default().fg(color)),
     ];
 
     // Only show position columns if not hidden
@@ -1145,11 +1320,11 @@ fn stock_to_row(stock: &Stock, usd_twd_rate: f64, show_portfolio: bool, hide_pos
         };
 
         let gain_color = if gain >= 0.0 { Color::Green } else { Color::Red };
-        let gain_str = format!("{:+.2}", gain);
+        let gain_str = format!("{:+.0}", gain);
         let gain_pct_str = format!("{:+.1}%", gain_pct);
 
-        cells.push(Cell::from(Line::from(format!("{:.2}", stock.quantity)).alignment(Alignment::Right)));
-        cells.push(Cell::from(Line::from(format!("{:.2}", stock.cost_basis)).alignment(Alignment::Right)));
+        cells.push(Cell::from(Line::from(format!("{:.0}", stock.quantity)).alignment(Alignment::Right)));
+        cells.push(Cell::from(Line::from(format!("{:.1}", stock.cost_basis)).alignment(Alignment::Right)));
         cells.push(Cell::from(Line::from(gain_str).alignment(Alignment::Right)).style(Style::default().fg(gain_color)));
         cells.push(Cell::from(Line::from(gain_pct_str).alignment(Alignment::Right)).style(Style::default().fg(gain_color)));
     }
@@ -1209,7 +1384,7 @@ fn render_summary(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hide_key = if app.hide_positions { "H=Show" } else { "H=Hide" };
-    let keys = format!(" 0-9=Portfolio | Tab=Section | ↑↓=Nav | Sort: p/c/y/g/G | a=Add | e=Edit | d=Delete | n=New | {} | r=Refresh | q=Quit ", hide_key);
+    let keys = format!(" 0-9=Portfolio | ↑↓jk=Nav | Enter=Detail | Sort:pcygG | a=Add e=Edit d=Del | {} | r=Refresh | q=Quit ", hide_key);
     let paragraph = Paragraph::new(keys)
         .style(Style::default().fg(Color::Yellow));
     f.render_widget(paragraph, area);
@@ -1310,6 +1485,143 @@ fn render_new_portfolio_dialog(f: &mut Frame, name: &str) {
         .block(Block::default().borders(Borders::ALL).title(" New Portfolio ").border_style(Style::default().fg(Color::Magenta)));
 
     f.render_widget(paragraph, area);
+}
+
+fn render_detail_view(f: &mut Frame, app: &App, symbol: &str) {
+    let area = centered_rect(80, 70, f.area());
+    f.render_widget(Clear, area);
+
+    // Find the stock in all vectors
+    let stock = app.tw_stocks.iter()
+        .chain(app.us_stocks.iter())
+        .chain(app.combined_tw_stocks.iter())
+        .chain(app.combined_us_stocks.iter())
+        .find(|s| s.symbol == symbol);
+
+    let Some(stock) = stock else {
+        let paragraph = Paragraph::new("Stock not found")
+            .block(Block::default().borders(Borders::ALL).title(" Detail View "));
+        f.render_widget(paragraph, area);
+        return;
+    };
+
+    // Split area into sections
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6),  // Info header
+            Constraint::Min(10),    // Chart
+            Constraint::Length(2),  // Footer
+        ])
+        .margin(1)
+        .split(area);
+
+    // Render border
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} - {} ", stock.display, stock.name))
+        .border_style(Style::default().fg(Color::Cyan));
+    f.render_widget(block, area);
+
+    // Info section
+    let (price, change_pct) = stock.price_data.as_ref()
+        .map(|d| (d.price, d.change_percent))
+        .unwrap_or((0.0, 0.0));
+
+    let price_color = if change_pct >= 0.0 { Color::Green } else { Color::Red };
+    let arrow = if change_pct >= 0.0 { "↑" } else { "↓" };
+
+    // Calculate 30-day high/low/avg from historical
+    let (high, low, avg, trend_str) = stock.historical.as_ref()
+        .map(|h| {
+            let closes = &h.closes;
+            let high = closes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let low = closes.iter().cloned().fold(f64::INFINITY, f64::min);
+            let avg = closes.iter().sum::<f64>() / closes.len() as f64;
+            let (trend, _) = App::calculate_trend(closes);
+            (high, low, avg, trend.to_string())
+        })
+        .unwrap_or((0.0, 0.0, 0.0, "·".to_string()));
+
+    let info_text = vec![
+        Line::from(vec![
+            Span::raw("  Current: "),
+            Span::styled(format!("{:.2}", price), Style::default().fg(price_color).bold()),
+            Span::raw("  "),
+            Span::styled(format!("{}{:.2}%", arrow, change_pct), Style::default().fg(price_color)),
+            Span::raw(format!("  |  30d Trend: {}", trend_str)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("  30-Day High: {:.2}", high), Style::default().fg(Color::Green)),
+            Span::raw("  |  "),
+            Span::styled(format!("Low: {:.2}", low), Style::default().fg(Color::Red)),
+            Span::raw("  |  "),
+            Span::raw(format!("Avg: {:.2}", avg)),
+        ]),
+    ];
+    let info_para = Paragraph::new(info_text);
+    f.render_widget(info_para, chunks[0]);
+
+    // Chart section
+    if let Some(historical) = &stock.historical {
+        let closes = &historical.closes;
+        if !closes.is_empty() {
+            // Create chart data points: (x, y) where x is day index
+            let data: Vec<(f64, f64)> = closes.iter()
+                .enumerate()
+                .map(|(i, &p)| (i as f64, p))
+                .collect();
+
+            let min_y = closes.iter().cloned().fold(f64::INFINITY, f64::min) * 0.98;
+            let max_y = closes.iter().cloned().fold(f64::NEG_INFINITY, f64::max) * 1.02;
+            let max_x = closes.len() as f64;
+
+            let datasets = vec![
+                Dataset::default()
+                    .name("Price")
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Cyan))
+                    .data(&data),
+            ];
+
+            let chart = Chart::new(datasets)
+                .block(Block::default().borders(Borders::ALL).title(" 30-Day Price History "))
+                .x_axis(
+                    Axis::default()
+                        .title("Days")
+                        .style(Style::default().fg(Color::Gray))
+                        .bounds([0.0, max_x])
+                        .labels(vec![
+                            Span::raw("30d ago"),
+                            Span::raw("Today"),
+                        ]),
+                )
+                .y_axis(
+                    Axis::default()
+                        .title("Price")
+                        .style(Style::default().fg(Color::Gray))
+                        .bounds([min_y, max_y])
+                        .labels(vec![
+                            Span::raw(format!("{:.1}", min_y)),
+                            Span::raw(format!("{:.1}", max_y)),
+                        ]),
+                );
+
+            f.render_widget(chart, chunks[1]);
+        }
+    } else {
+        let no_data = Paragraph::new("  No historical data available")
+            .block(Block::default().borders(Borders::ALL).title(" 30-Day Price History "))
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(no_data, chunks[1]);
+    }
+
+    // Footer
+    let footer = Paragraph::new("  Press Esc or Enter to close")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(footer, chunks[2]);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

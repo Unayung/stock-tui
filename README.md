@@ -9,12 +9,14 @@ A terminal-based stock portfolio tracker with real-time price data from Yahoo Fi
 ## Features
 
 - Real-time stock prices from Yahoo Finance
+- 30-day price chart in detail view (press Enter)
 - Multiple portfolio support with combined view
 - Taiwan (.TW) and US stock markets
 - USD/TWD exchange rate conversion
 - Gain/loss tracking with cost basis
 - Sortable columns (price, change %, quantity, gain)
 - Add, edit, and delete stocks
+- Privacy mode to hide position details
 - Vim-style keyboard navigation
 
 ## Requirements
@@ -56,6 +58,7 @@ stock-tui
 | `Tab` | Switch between TW/US sections |
 | `j/k` or `↑/↓` | Navigate rows |
 | `h/l` or `←/→`| Switch portfolios |
+| `Enter` | View stock detail with 30-day chart |
 | `a` | Add stock |
 | `e` | Edit selected stock |
 | `d` | Delete selected stock |
@@ -93,7 +96,10 @@ Taiwan stock codes are auto-detected. Enter `2330` and it will be converted to `
 
 ## Data Source
 
-Stock prices are fetched from Yahoo Finance API. Prices are cached for 60 seconds to reduce API calls.
+Stock prices are fetched from Yahoo Finance API:
+- Prices are loaded on startup and cached for 60 seconds
+- Press `Enter` on a stock to view 30-day price chart (historical data cached for 6 hours)
+- Press `r` to refresh all prices
 
 ## License
 
