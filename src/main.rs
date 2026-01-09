@@ -19,11 +19,31 @@ use std::{
     fs::{self, File},
     io::{self, BufRead, BufReader, Write},
     path::PathBuf,
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
     time::{Duration, Instant},
 };
 
 const CACHE_DURATION_SECS: u64 = 60;
 const HISTORICAL_CACHE_DURATION_SECS: u64 = 6 * 60 * 60; // 6 hours for historical data
+
+/// Message sent from background fetch thread to main thread
+#[derive(Debug)]
+struct FetchResult {
+    symbol: String,
+    price_data: Option<PriceData>,
+}
+
+/// Message indicating a batch fetch has completed
+#[derive(Debug)]
+enum FetchMessage {
+    /// Individual price result
+    Price(FetchResult),
+    /// Exchange rate result
+    ExchangeRate(f64),
+    /// All fetches in this batch are complete
+    BatchComplete,
+}
 
 /// Tracks clickable UI regions for mouse interaction
 #[derive(Default, Clone)]
@@ -142,10 +162,15 @@ struct App {
     live_mode: bool,      // Toggle with 'L' for auto-refresh every 5 seconds
     last_live_refresh: Instant,
     clickable_regions: ClickableRegions,
+    // Async fetch infrastructure
+    fetch_receiver: Receiver<FetchMessage>,
+    fetch_sender: Sender<FetchMessage>,
+    is_fetching: bool, // True when background fetch is in progress
 }
 
 impl App {
     fn new() -> Result<Self> {
+        let (fetch_sender, fetch_receiver) = mpsc::channel();
         let mut app = App {
             portfolios: Vec::new(),
             current_portfolio_idx: 0,
@@ -170,6 +195,9 @@ impl App {
             live_mode: false,
             last_live_refresh: Instant::now(),
             clickable_regions: ClickableRegions::default(),
+            fetch_receiver,
+            fetch_sender,
+            is_fetching: false,
         };
         app.load_portfolios()?;
         app.refresh_data()?;
@@ -340,7 +368,7 @@ impl App {
             }
         }
 
-        // Fetch from Yahoo Finance (blocking for simplicity)
+        // Use chart API (v7 quote API is restricted by Yahoo)
         let urls = [
             format!("https://query2.finance.yahoo.com/v8/finance/chart/{}", symbol),
             format!("https://query1.finance.yahoo.com/v8/finance/chart/{}", symbol),
@@ -392,6 +420,89 @@ impl App {
         } else {
             32.0
         }
+    }
+
+    /// Start an async background refresh of all stock prices
+    /// Results will be sent through the fetch_receiver channel
+    fn start_async_refresh(&mut self) {
+        if self.is_fetching {
+            return; // Already fetching
+        }
+
+        self.is_fetching = true;
+        let sender = self.fetch_sender.clone();
+
+        // Collect all symbols we need to fetch
+        let symbols: Vec<String> = if self.view_combined {
+            self.combined_stocks.iter().map(|s| s.symbol.clone()).collect()
+        } else {
+            self.stocks.iter().map(|s| s.symbol.clone()).collect()
+        };
+
+        // Spawn background thread
+        thread::spawn(move || {
+            // Fetch exchange rate first
+            if let Some(rate) = fetch_price_blocking("USDTWD=X") {
+                let _ = sender.send(FetchMessage::ExchangeRate(rate.price));
+            }
+
+            // Fetch each stock price
+            for symbol in symbols {
+                let price_data = fetch_price_blocking(&symbol);
+                let _ = sender.send(FetchMessage::Price(FetchResult {
+                    symbol,
+                    price_data,
+                }));
+            }
+
+            // Signal completion
+            let _ = sender.send(FetchMessage::BatchComplete);
+        });
+    }
+
+    /// Process any pending fetch results from background thread
+    /// Returns true if any updates were received
+    fn process_fetch_results(&mut self) -> bool {
+        let mut updated = false;
+
+        // Non-blocking receive of all pending messages
+        while let Ok(msg) = self.fetch_receiver.try_recv() {
+            match msg {
+                FetchMessage::Price(result) => {
+                    // Update price in all stock vectors
+                    if let Some(ref price_data) = result.price_data {
+                        // Update cache
+                        self.cache.insert(result.symbol.clone(), (price_data.clone(), Instant::now()));
+
+                        // Update all stock vectors
+                        for stock in self.stocks.iter_mut()
+                            .chain(self.tw_stocks.iter_mut())
+                            .chain(self.us_stocks.iter_mut())
+                            .chain(self.combined_stocks.iter_mut())
+                            .chain(self.combined_tw_stocks.iter_mut())
+                            .chain(self.combined_us_stocks.iter_mut())
+                        {
+                            if stock.symbol == result.symbol {
+                                stock.price_data = Some(price_data.clone());
+                            }
+                        }
+                    }
+                    updated = true;
+                }
+                FetchMessage::ExchangeRate(rate) => {
+                    self.usd_twd_rate = rate;
+                    updated = true;
+                }
+                FetchMessage::BatchComplete => {
+                    self.is_fetching = false;
+                    self.last_update = Instant::now();
+                    self.sort_stocks(); // Re-sort after all prices updated
+                    updated = true;
+                }
+            }
+        }
+
+        updated
     }
 
     fn fetch_historical(&mut self, symbol: &str) -> Option<HistoricalData> {
@@ -814,6 +925,43 @@ impl App {
     }
 }
 
+/// Standalone blocking price fetch for use in background threads
+/// Does not use any caching - always fetches fresh data
+fn fetch_price_blocking(symbol: &str) -> Option<PriceData> {
+    // Use chart API (v7 quote API is restricted by Yahoo)
+    let urls = [
+        format!("https://query2.finance.yahoo.com/v8/finance/chart/{}", symbol),
+        format!("https://query1.finance.yahoo.com/v8/finance/chart/{}", symbol),
+    ];
+
+    for url in &urls {
+        if let Ok(response) = reqwest::blocking::Client::new()
+            .get(url)
+            .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+            .timeout(Duration::from_secs(5))
+            .send()
+        {
+            if let Ok(data) = response.json::<serde_json::Value>() {
+                if let Some(result) = data["chart"]["result"].get(0) {
+                    let meta = &result["meta"];
+                    let price = meta["regularMarketPrice"].as_f64()
+                        .or_else(|| meta["previousClose"].as_f64());
+                    let prev_close = meta["previousClose"].as_f64()
+                        .or_else(|| meta["chartPreviousClose"].as_f64());
+
+                    if let (Some(price), Some(prev)) = (price, prev_close) {
+                        let change = price - prev;
+                        let change_percent = (change / prev) * 100.0;
+                        return Some(PriceData { price, change, change_percent });
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -861,17 +1009,20 @@ const LIVE_REFRESH_INTERVAL_SECS: u64 = 5;
 
 fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
+        // Process any pending fetch results from background thread (non-blocking)
+        app.process_fetch_results();
+
         terminal.draw(|f| ui(f, app))?;
         // Note: clickable_regions are updated during ui() rendering
 
-        // Live mode: auto-refresh every 5 seconds
+        // Live mode: start async refresh every 5 seconds (non-blocking)
         if app.live_mode
+            && !app.is_fetching
             && matches!(app.input_mode, InputMode::Normal)
             && app.last_live_refresh.elapsed().as_secs() >= LIVE_REFRESH_INTERVAL_SECS
         {
-            app.cache.clear(); // Clear cache to get fresh prices
-            app.refresh_data()?;
             app.last_live_refresh = Instant::now();
+            app.start_async_refresh();
         }
 
         if event::poll(Duration::from_millis(100))? {
@@ -909,9 +1060,11 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                         app.input_mode = InputMode::Normal;
                     }
                     Action::Refresh => {
-                        app.cache.clear();
-                        app.historical_cache.clear();
-                        app.refresh_data()?;
+                        if !app.is_fetching {
+                            app.cache.clear();
+                            app.historical_cache.clear();
+                            app.start_async_refresh();
+                        }
                     }
                     Action::SwitchPortfolio(idx) => {
                         app.view_combined = false;
@@ -1590,8 +1743,10 @@ fn render_summary(f: &mut Frame, app: &App, area: Rect) {
 
     let time_str = Local::now().format("%H:%M:%S").to_string();
 
-    // Live mode indicator with countdown
-    let live_indicator = if app.live_mode {
+    // Status indicator: refreshing, live mode countdown, or nothing
+    let status_indicator = if app.is_fetching {
+        "  |  Refreshing...".to_string()
+    } else if app.live_mode {
         let elapsed = app.last_live_refresh.elapsed().as_secs();
         let remaining = LIVE_REFRESH_INTERVAL_SECS.saturating_sub(elapsed);
         format!("  |  LIVE ({}s)", remaining)
@@ -1599,12 +1754,14 @@ fn render_summary(f: &mut Frame, app: &App, area: Rect) {
         String::new()
     };
 
+    let status_color = if app.is_fetching { Color::Yellow } else { Color::Green };
+
     let text = if app.hide_positions {
         // Show minimal info when positions are hidden
         vec![
             Line::from(vec![
                 Span::styled(format!("Updated: {}  |  USD/TWD: {:.2}", time_str, app.usd_twd_rate), Style::default().fg(Color::DarkGray)),
-                Span::styled(live_indicator.clone(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(status_indicator.clone(), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(""),
             Line::from(vec![
@@ -1618,7 +1775,7 @@ fn render_summary(f: &mut Frame, app: &App, area: Rect) {
         vec![
             Line::from(vec![
                 Span::styled(format!("Updated: {}  |  USD/TWD: {:.2}", time_str, app.usd_twd_rate), Style::default().fg(Color::DarkGray)),
-                Span::styled(live_indicator, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(status_indicator, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(""),
             Line::from(format!("  Total Cost:   {:>15.2} TWD", total_cost)),
