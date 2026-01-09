@@ -11,6 +11,8 @@ A terminal-based stock portfolio tracker with real-time price data from Yahoo Fi
 ## Features
 
 - Real-time stock prices from Yahoo Finance
+- **Live mode** - auto-refresh prices every 5 seconds
+- **Mouse/touch support** - click to navigate, select, and toggle options
 - 30-day price chart in detail view (press Enter)
 - Multiple portfolio support with combined view
 - Taiwan (.TW) and US stock markets
@@ -76,6 +78,7 @@ This loads `demo.conf` with sample TW and US stocks for testing.
 | `d` | Delete selected stock |
 | `n` | Create new portfolio |
 | `r` | Refresh prices |
+| `L` | Toggle live mode (auto-refresh every 5s) |
 | `H` | Toggle hide positions (privacy mode) |
 | `p` | Sort by price |
 | `c` | Sort by change % |
@@ -83,6 +86,20 @@ This loads `demo.conf` with sample TW and US stocks for testing.
 | `g` | Sort by gain |
 | `G` | Sort by gain % |
 | `q` | Quit |
+
+### Mouse/Touch Support
+
+| Click Target | Action |
+|-------------|--------|
+| Portfolio tab (`0:ALL`, `1:main`, etc.) | Switch to that portfolio |
+| Stock row | Select row and activate section |
+| Selected stock row (click again) | Open detail view |
+| `H=Hide` / `H=Show` in footer | Toggle privacy mode |
+| `L=Live` / `L=Live:ON` in footer | Toggle live mode |
+| `r=Refresh` in footer | Refresh prices |
+| `q=Quit` in footer | Exit application |
+| Table area | Activate TW/US section |
+| Detail view (anywhere) | Close detail view |
 
 ## Configuration
 
@@ -111,7 +128,8 @@ Taiwan stock codes are auto-detected. Enter `2330` and it will be converted to `
 Stock prices are fetched from Yahoo Finance API:
 - Prices are loaded on startup and cached for 60 seconds
 - Press `Enter` on a stock to view 30-day price chart (historical data cached for 6 hours)
-- Press `r` to refresh all prices
+- Press `r` to refresh all prices (clears cache)
+- Press `L` to enable live mode (auto-refresh every 5 seconds, bypasses cache)
 
 ## License
 

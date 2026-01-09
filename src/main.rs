@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::Local;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -24,6 +24,23 @@ use std::{
 
 const CACHE_DURATION_SECS: u64 = 60;
 const HISTORICAL_CACHE_DURATION_SECS: u64 = 6 * 60 * 60; // 6 hours for historical data
+
+/// Tracks clickable UI regions for mouse interaction
+#[derive(Default, Clone)]
+struct ClickableRegions {
+    /// Portfolio tab areas: (rect, portfolio_index) - index 0 = "ALL" combined view
+    portfolio_tabs: Vec<(Rect, usize)>,
+    /// Taiwan stocks table area
+    tw_table: Rect,
+    /// US stocks table area
+    us_table: Rect,
+    /// Individual TW stock rows: (rect, row_index)
+    tw_rows: Vec<(Rect, usize)>,
+    /// Individual US stock rows: (rect, row_index)
+    us_rows: Vec<(Rect, usize)>,
+    /// Footer button regions: (rect, action_name)
+    footer_buttons: Vec<(Rect, &'static str)>,
+}
 
 #[derive(Clone, Debug)]
 struct Stock {
@@ -121,7 +138,10 @@ struct App {
     historical_cache: HashMap<String, HistoricalData>,
     sort_column: Option<SortColumn>,
     sort_direction: SortDirection,
-    hide_positions: bool, // Toggle with 'h' to hide cost/quantity/gain for privacy
+    hide_positions: bool, // Toggle with 'H' to hide cost/quantity/gain for privacy
+    live_mode: bool,      // Toggle with 'L' for auto-refresh every 5 seconds
+    last_live_refresh: Instant,
+    clickable_regions: ClickableRegions,
 }
 
 impl App {
@@ -147,6 +167,9 @@ impl App {
             sort_column: Some(SortColumn::Change), // Default sort by change %
             sort_direction: SortDirection::Descending,
             hide_positions: false,
+            live_mode: false,
+            last_live_refresh: Instant::now(),
+            clickable_regions: ClickableRegions::default(),
         };
         app.load_portfolios()?;
         app.refresh_data()?;
@@ -826,21 +849,45 @@ enum Action {
     Refresh,
     SwitchPortfolio(usize),
     Sort(SortColumn),
+    ToggleLive,
+    ToggleHide,
+    SelectTwRow(usize),
+    SelectUsRow(usize),
+    ViewCombined,
+    OpenDetail,
 }
+
+const LIVE_REFRESH_INTERVAL_SECS: u64 = 5;
 
 fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
+        // Note: clickable_regions are updated during ui() rendering
+
+        // Live mode: auto-refresh every 5 seconds
+        if app.live_mode
+            && matches!(app.input_mode, InputMode::Normal)
+            && app.last_live_refresh.elapsed().as_secs() >= LIVE_REFRESH_INTERVAL_SECS
+        {
+            app.cache.clear(); // Clear cache to get fresh prices
+            app.refresh_data()?;
+            app.last_live_refresh = Instant::now();
+        }
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            let event = event::read()?;
+
+            let action = match event {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_input(app, key.code)
                 }
+                Event::Mouse(mouse) => {
+                    handle_mouse(app, mouse.kind, mouse.column, mouse.row)
+                }
+                _ => Action::None,
+            };
 
-                let action = handle_input(app, key.code);
-
-                match action {
+            match action {
                     Action::Quit => return Ok(()),
                     Action::AddStock(symbol, display, name, qty, cost) => {
                         app.add_stock(symbol, display, name, qty, cost)?;
@@ -876,9 +923,46 @@ fn run_app<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut A
                     Action::Sort(column) => {
                         app.toggle_sort(column);
                     }
+                    Action::ToggleLive => {
+                        app.live_mode = !app.live_mode;
+                        if app.live_mode {
+                            app.last_live_refresh = Instant::now();
+                        }
+                    }
+                    Action::ToggleHide => {
+                        app.hide_positions = !app.hide_positions;
+                    }
+                    Action::SelectTwRow(idx) => {
+                        app.active_section = 0;
+                        app.table_state_tw.select(Some(idx));
+                    }
+                    Action::SelectUsRow(idx) => {
+                        app.active_section = 1;
+                        app.table_state_us.select(Some(idx));
+                    }
+                    Action::ViewCombined => {
+                        app.view_combined = true;
+                        app.table_state_tw.select(Some(0));
+                        app.table_state_us.select(Some(0));
+                    }
+                    Action::OpenDetail => {
+                        if let Some(stock) = app.get_selected_stock() {
+                            let symbol = stock.symbol.clone();
+                            let historical = app.fetch_historical(&symbol);
+                            // Update historical data in all vectors
+                            for s in app.stocks.iter_mut().chain(app.tw_stocks.iter_mut())
+                                .chain(app.us_stocks.iter_mut()).chain(app.combined_stocks.iter_mut())
+                                .chain(app.combined_tw_stocks.iter_mut()).chain(app.combined_us_stocks.iter_mut())
+                            {
+                                if s.symbol == symbol {
+                                    s.historical = historical.clone();
+                                }
+                            }
+                            app.input_mode = InputMode::DetailView(symbol);
+                        }
+                    }
                     Action::None => {}
                 }
-            }
         }
     }
 }
@@ -967,6 +1051,14 @@ fn handle_input(app: &mut App, key: KeyCode) -> Action {
             // Toggle hide positions for privacy
             KeyCode::Char('H') => {
                 app.hide_positions = !app.hide_positions;
+                Action::None
+            }
+            // Toggle live mode (auto-refresh every 5 seconds)
+            KeyCode::Char('L') => {
+                app.live_mode = !app.live_mode;
+                if app.live_mode {
+                    app.last_live_refresh = Instant::now();
+                }
                 Action::None
             }
             // Enter to view stock detail - fetch historical on demand
@@ -1130,7 +1222,93 @@ fn handle_input(app: &mut App, key: KeyCode) -> Action {
     }
 }
 
-fn ui(f: &mut Frame, app: &App) {
+/// Check if a point (x, y) is inside a Rect
+fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+}
+
+fn handle_mouse(app: &mut App, kind: MouseEventKind, x: u16, y: u16) -> Action {
+    // Only handle left clicks
+    let is_click = matches!(kind, MouseEventKind::Down(MouseButton::Left));
+
+    if !is_click {
+        return Action::None;
+    }
+
+    // In detail view, any click closes it
+    if matches!(app.input_mode, InputMode::DetailView(_)) {
+        app.input_mode = InputMode::Normal;
+        return Action::None;
+    }
+
+    // Only handle mouse in Normal mode
+    if !matches!(app.input_mode, InputMode::Normal) {
+        return Action::None;
+    }
+
+    let regions = &app.clickable_regions;
+
+    // Check portfolio tabs
+    for (rect, idx) in &regions.portfolio_tabs {
+        if point_in_rect(x, y, *rect) {
+            if *idx == 0 {
+                return Action::ViewCombined;
+            } else {
+                return Action::SwitchPortfolio(*idx - 1);
+            }
+        }
+    }
+
+    // Check TW stock table rows
+    // Click on already-selected row opens detail view
+    for (rect, row_idx) in &regions.tw_rows {
+        if point_in_rect(x, y, *rect) {
+            let currently_selected = app.table_state_tw.selected() == Some(*row_idx) && app.active_section == 0;
+            if currently_selected {
+                return Action::OpenDetail;
+            }
+            return Action::SelectTwRow(*row_idx);
+        }
+    }
+
+    // Check US stock table rows
+    for (rect, row_idx) in &regions.us_rows {
+        if point_in_rect(x, y, *rect) {
+            let currently_selected = app.table_state_us.selected() == Some(*row_idx) && app.active_section == 1;
+            if currently_selected {
+                return Action::OpenDetail;
+            }
+            return Action::SelectUsRow(*row_idx);
+        }
+    }
+
+    // Check footer buttons
+    for (rect, action_name) in &regions.footer_buttons {
+        if point_in_rect(x, y, *rect) {
+            return match *action_name {
+                "live" => Action::ToggleLive,
+                "hide" => Action::ToggleHide,
+                "refresh" => Action::Refresh,
+                "quit" => Action::Quit,
+                _ => Action::None,
+            };
+        }
+    }
+
+    // Click on table area but not on a row - activate that section
+    if point_in_rect(x, y, regions.tw_table) {
+        app.active_section = 0;
+    } else if point_in_rect(x, y, regions.us_table) {
+        app.active_section = 1;
+    }
+
+    Action::None
+}
+
+fn ui(f: &mut Frame, app: &mut App) {
+    // Clear clickable regions before each render
+    app.clickable_regions = ClickableRegions::default();
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1157,7 +1335,7 @@ fn ui(f: &mut Frame, app: &App) {
     }
 }
 
-fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
+fn render_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     let mut titles: Vec<Line> = vec![
         if app.view_combined {
             Line::from(" 0:ALL ").magenta().bold()
@@ -1166,13 +1344,28 @@ fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
         }
     ];
 
+    // Track tab widths for click detection
+    let mut tab_widths: Vec<usize> = vec![7]; // " 0:ALL " = 7 chars
+
     for (i, p) in app.portfolios.iter().enumerate() {
         let title = format!(" {}:{} ", i + 1, p.name);
+        tab_widths.push(title.len());
         if !app.view_combined && i == app.current_portfolio_idx {
             titles.push(Line::from(title).cyan().bold());
         } else {
             titles.push(Line::from(title).dark_gray());
         }
+    }
+
+    // Calculate clickable regions for tabs (inside the border)
+    let inner_x = area.x + 1; // Account for left border
+    let tab_y = area.y + 1;   // Account for top border
+    let mut current_x = inner_x;
+
+    for (i, width) in tab_widths.iter().enumerate() {
+        let tab_rect = Rect::new(current_x, tab_y, *width as u16, 1);
+        app.clickable_regions.portfolio_tabs.push((tab_rect, i));
+        current_x += *width as u16 + 1; // +1 for divider "|"
     }
 
     let tabs = Tabs::new(titles)
@@ -1182,11 +1375,42 @@ fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(tabs, area);
 }
 
-fn render_stock_tables(f: &mut Frame, app: &App, area: Rect) {
+fn render_stock_tables(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
+
+    // Record table areas for click detection
+    app.clickable_regions.tw_table = chunks[0];
+    app.clickable_regions.us_table = chunks[1];
+
+    // Get stock counts first to avoid borrow issues
+    let tw_count = if app.view_combined { app.combined_tw_stocks.len() } else { app.tw_stocks.len() };
+    let us_count = if app.view_combined { app.combined_us_stocks.len() } else { app.us_stocks.len() };
+
+    // Calculate row regions (rows start after border + header)
+    let tw_row_start_y = chunks[0].y + 2; // +1 border, +1 header
+    let tw_row_width = chunks[0].width.saturating_sub(2); // -2 for borders
+    let tw_row_x = chunks[0].x + 1;
+    for i in 0..tw_count {
+        let row_y = tw_row_start_y + i as u16;
+        if row_y < chunks[0].y + chunks[0].height - 1 { // Don't exceed table bounds
+            let row_rect = Rect::new(tw_row_x, row_y, tw_row_width, 1);
+            app.clickable_regions.tw_rows.push((row_rect, i));
+        }
+    }
+
+    let us_row_start_y = chunks[1].y + 2;
+    let us_row_width = chunks[1].width.saturating_sub(2);
+    let us_row_x = chunks[1].x + 1;
+    for i in 0..us_count {
+        let row_y = us_row_start_y + i as u16;
+        if row_y < chunks[1].y + chunks[1].height - 1 {
+            let row_rect = Rect::new(us_row_x, row_y, us_row_width, 1);
+            app.clickable_regions.us_rows.push((row_rect, i));
+        }
+    }
 
     let tw_stocks = app.get_active_tw_stocks();
     let us_stocks = app.get_active_us_stocks();
@@ -1366,11 +1590,21 @@ fn render_summary(f: &mut Frame, app: &App, area: Rect) {
 
     let time_str = Local::now().format("%H:%M:%S").to_string();
 
+    // Live mode indicator with countdown
+    let live_indicator = if app.live_mode {
+        let elapsed = app.last_live_refresh.elapsed().as_secs();
+        let remaining = LIVE_REFRESH_INTERVAL_SECS.saturating_sub(elapsed);
+        format!("  |  LIVE ({}s)", remaining)
+    } else {
+        String::new()
+    };
+
     let text = if app.hide_positions {
         // Show minimal info when positions are hidden
         vec![
             Line::from(vec![
                 Span::styled(format!("Updated: {}  |  USD/TWD: {:.2}", time_str, app.usd_twd_rate), Style::default().fg(Color::DarkGray)),
+                Span::styled(live_indicator.clone(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(""),
             Line::from(vec![
@@ -1384,6 +1618,7 @@ fn render_summary(f: &mut Frame, app: &App, area: Rect) {
         vec![
             Line::from(vec![
                 Span::styled(format!("Updated: {}  |  USD/TWD: {:.2}", time_str, app.usd_twd_rate), Style::default().fg(Color::DarkGray)),
+                Span::styled(live_indicator, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(""),
             Line::from(format!("  Total Cost:   {:>15.2} TWD", total_cost)),
@@ -1403,11 +1638,51 @@ fn render_summary(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
-fn render_footer(f: &mut Frame, app: &App, area: Rect) {
+fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
     let hide_key = if app.hide_positions { "H=Show" } else { "H=Hide" };
-    let keys = format!(" 0-9=Portfolio | ↑↓jk=Nav | Enter=Detail | Sort:pcygG | a=Add e=Edit d=Del | {} | r=Refresh | q=Quit ", hide_key);
-    let paragraph = Paragraph::new(keys)
-        .style(Style::default().fg(Color::Yellow));
+    let live_key = if app.live_mode { "L=Live:ON" } else { "L=Live" };
+
+    let base_keys = format!(" 0-9=Portfolio | ↑↓jk=Nav | Enter=Detail | Sort:pcygG | a=Add e=Edit d=Del | {} | ", hide_key);
+
+    // Calculate button positions for click detection
+    let base_len = base_keys.len() as u16;
+    let live_len = live_key.len() as u16;
+
+    // Hide button position (find "H=Show" or "H=Hide" in base_keys)
+    if let Some(hide_pos) = base_keys.find(hide_key) {
+        let hide_rect = Rect::new(area.x + hide_pos as u16, area.y, hide_key.len() as u16, 1);
+        app.clickable_regions.footer_buttons.push((hide_rect, "hide"));
+    }
+
+    // Live button position (after base_keys)
+    let live_rect = Rect::new(area.x + base_len, area.y, live_len, 1);
+    app.clickable_regions.footer_buttons.push((live_rect, "live"));
+
+    // Refresh button position
+    let refresh_start = base_len + live_len + 3; // " | " = 3 chars
+    let refresh_rect = Rect::new(area.x + refresh_start, area.y, 9, 1); // "r=Refresh" = 9
+    app.clickable_regions.footer_buttons.push((refresh_rect, "refresh"));
+
+    // Quit button position
+    let quit_start = refresh_start + 9 + 3; // "r=Refresh" + " | "
+    let quit_rect = Rect::new(area.x + quit_start, area.y, 6, 1); // "q=Quit" = 6
+    app.clickable_regions.footer_buttons.push((quit_rect, "quit"));
+
+    let spans = if app.live_mode {
+        vec![
+            Span::styled(base_keys, Style::default().fg(Color::Yellow)),
+            Span::styled(live_key, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" | r=Refresh | q=Quit ", Style::default().fg(Color::Yellow)),
+        ]
+    } else {
+        vec![
+            Span::styled(base_keys, Style::default().fg(Color::Yellow)),
+            Span::styled(live_key, Style::default().fg(Color::Yellow)),
+            Span::styled(" | r=Refresh | q=Quit ", Style::default().fg(Color::Yellow)),
+        ]
+    };
+
+    let paragraph = Paragraph::new(Line::from(spans));
     f.render_widget(paragraph, area);
 }
 
