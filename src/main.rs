@@ -158,8 +158,9 @@ struct App {
     historical_cache: HashMap<String, HistoricalData>,
     sort_column: Option<SortColumn>,
     sort_direction: SortDirection,
-    hide_positions: bool, // Toggle with 'H' to hide cost/quantity/gain for privacy
-    live_mode: bool,      // Toggle with 'L' for auto-refresh every 5 seconds
+    hide_positions: bool,   // Toggle with 'H' to hide cost/quantity/gain for privacy
+    live_mode: bool,        // Toggle with 'L' for auto-refresh every 5 seconds
+    show_gain_amount: bool, // Toggle with 'T' to switch between gain amount and percentage in titles
     last_live_refresh: Instant,
     clickable_regions: ClickableRegions,
     // Async fetch infrastructure
@@ -193,6 +194,7 @@ impl App {
             sort_direction: SortDirection::Descending,
             hide_positions: false,
             live_mode: false,
+            show_gain_amount: false, // Start with percentage display
             last_live_refresh: Instant::now(),
             clickable_regions: ClickableRegions::default(),
             fetch_receiver,
@@ -830,6 +832,45 @@ impl App {
         (total_cost, total_value, total_gain, total_gain_percent, stocks.len(), holdings)
     }
 
+    // Returns: (tw_value, tw_gain, tw_gain_pct, us_value_usd, us_gain_usd, us_gain_pct)
+    fn calculate_market_summary(&self) -> (f64, f64, f64, f64, f64, f64) {
+        let stocks = if self.view_combined {
+            &self.combined_stocks
+        } else {
+            &self.stocks
+        };
+
+        let mut tw_cost = 0.0;
+        let mut tw_value = 0.0;
+        let mut us_cost = 0.0;
+        let mut us_value = 0.0;
+
+        for stock in stocks {
+            if stock.quantity > 0.0 {
+                if let Some(ref data) = stock.price_data {
+                    let cost = stock.quantity * stock.cost_basis;
+                    let value = stock.quantity * data.price;
+
+                    if stock.symbol.contains(".TW") {
+                        tw_cost += cost;
+                        tw_value += value;
+                    } else {
+                        us_cost += cost;
+                        us_value += value;
+                    }
+                }
+            }
+        }
+
+        let tw_gain = tw_value - tw_cost;
+        let tw_gain_pct = if tw_cost > 0.0 { (tw_gain / tw_cost) * 100.0 } else { 0.0 };
+
+        let us_gain = us_value - us_cost;
+        let us_gain_pct = if us_cost > 0.0 { (us_gain / us_cost) * 100.0 } else { 0.0 };
+
+        (tw_value, tw_gain, tw_gain_pct, us_value, us_gain, us_gain_pct)
+    }
+
     fn next_row(&mut self) {
         let len = if self.active_section == 0 {
             if self.view_combined { self.combined_tw_stocks.len() } else { self.tw_stocks.len() }
@@ -1214,6 +1255,11 @@ fn handle_input(app: &mut App, key: KeyCode) -> Action {
                 }
                 Action::None
             }
+            // Toggle between gain amount and percentage in table titles
+            KeyCode::Char('T') => {
+                app.show_gain_amount = !app.show_gain_amount;
+                Action::None
+            }
             // Enter to view stock detail - fetch historical on demand
             KeyCode::Enter => {
                 if let Some(stock) = app.get_selected_stock() {
@@ -1467,7 +1513,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Length(3),  // Tabs
             Constraint::Min(10),    // Main content
-            Constraint::Length(7),  // Summary
+            Constraint::Length(8),  // Summary
             Constraint::Length(2),  // Footer
         ])
         .split(f.area());
@@ -1625,8 +1671,27 @@ fn render_stock_tables(f: &mut Frame, app: &mut App, area: Rect) {
             .height(1)
     };
 
+    // Calculate market totals for titles
+    let (tw_value, tw_gain, tw_gain_pct, us_value, us_gain, us_gain_pct) = app.calculate_market_summary();
+    let tw_gain_color = if tw_gain >= 0.0 { Color::Green } else { Color::Red };
+    let us_gain_color = if us_gain >= 0.0 { Color::Green } else { Color::Red };
+
     // TW Stocks
-    let tw_title = if app.view_combined { "Taiwan Stocks (All)" } else { "Taiwan Stocks" };
+    let tw_base = if app.view_combined { "Taiwan Stocks (All)" } else { "Taiwan Stocks" };
+    let tw_title: Line = if app.hide_positions {
+        Line::from(tw_base)
+    } else {
+        let tw_gain_display = if app.show_gain_amount {
+            format!("{:+.0} TWD", tw_gain)
+        } else {
+            format!("{:+.2}%", tw_gain_pct)
+        };
+        Line::from(vec![
+            Span::raw(format!("{} ", tw_base)),
+            Span::styled(format!("{:.0} TWD ", tw_value), Style::default().fg(Color::White)),
+            Span::styled(tw_gain_display, Style::default().fg(tw_gain_color)),
+        ])
+    };
     let tw_rows: Vec<Row> = tw_stocks.iter().map(|s| stock_to_row(s, app.usd_twd_rate, app.view_combined, app.hide_positions)).collect();
     let tw_table = Table::new(tw_rows, get_widths(app.view_combined, app.hide_positions))
         .header(header.clone())
@@ -1637,7 +1702,21 @@ fn render_stock_tables(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(tw_table, chunks[0], &mut app.table_state_tw.clone());
 
     // US Stocks
-    let us_title = if app.view_combined { "US Stocks (All)" } else { "US Stocks" };
+    let us_base = if app.view_combined { "US Stocks (All)" } else { "US Stocks" };
+    let us_title: Line = if app.hide_positions {
+        Line::from(us_base)
+    } else {
+        let us_gain_display = if app.show_gain_amount {
+            format!("{:+.2} USD", us_gain)
+        } else {
+            format!("{:+.2}%", us_gain_pct)
+        };
+        Line::from(vec![
+            Span::raw(format!("{} ", us_base)),
+            Span::styled(format!("{:.2} USD ", us_value), Style::default().fg(Color::White)),
+            Span::styled(us_gain_display, Style::default().fg(us_gain_color)),
+        ])
+    };
     let us_rows: Vec<Row> = us_stocks.iter().map(|s| stock_to_row(s, app.usd_twd_rate, app.view_combined, app.hide_positions)).collect();
     let us_table = Table::new(us_rows, get_widths(app.view_combined, app.hide_positions))
         .header(header)
@@ -1798,8 +1877,9 @@ fn render_summary(f: &mut Frame, app: &App, area: Rect) {
 fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
     let hide_key = if app.hide_positions { "H=Show" } else { "H=Hide" };
     let live_key = if app.live_mode { "L=Live:ON" } else { "L=Live" };
+    let title_key = if app.show_gain_amount { "T=$" } else { "T=%" };
 
-    let base_keys = format!(" 0-9=Portfolio | ↑↓jk=Nav | Enter=Detail | Sort:pcygG | a=Add e=Edit d=Del | {} | ", hide_key);
+    let base_keys = format!(" 0-9=Portfolio | ↑↓jk=Nav | Enter=Detail | Sort:pcygG | a=Add e=Edit d=Del | {} {} | ", hide_key, title_key);
 
     // Calculate button positions for click detection
     let base_len = base_keys.len() as u16;
