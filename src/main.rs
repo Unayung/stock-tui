@@ -1124,7 +1124,7 @@ fn handle_input(app: &mut App, key: KeyCode) -> Action {
     match &mut app.input_mode {
         InputMode::Normal => match key {
             KeyCode::Char('q') => Action::Quit,
-            KeyCode::Char('0') => {
+            KeyCode::Char('0') | KeyCode::Char('`') => {
                 app.view_combined = true;
                 app.table_state_tw.select(Some(0));
                 app.table_state_us.select(Some(0));
@@ -1491,14 +1491,14 @@ fn ui(f: &mut Frame, app: &mut App) {
 fn render_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     let mut titles: Vec<Line> = vec![
         if app.view_combined {
-            Line::from(" 0:ALL ").magenta().bold()
+            Line::from(" `/0:ALL ").magenta().bold()
         } else {
-            Line::from(" 0:ALL ").dark_gray()
+            Line::from(" `/0:ALL ").dark_gray()
         }
     ];
 
     // Track tab widths for click detection
-    let mut tab_widths: Vec<usize> = vec![7]; // " 0:ALL " = 7 chars
+    let mut tab_widths: Vec<usize> = vec![9]; // " `/0:ALL " = 9 chars
 
     for (i, p) in app.portfolios.iter().enumerate() {
         let title = format!(" {}:{} ", i + 1, p.name);
