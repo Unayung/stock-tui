@@ -136,6 +136,7 @@ struct EditStockState {
     symbol: String,
     quantity: String,
     cost_basis: String,
+    step: usize, // 0 = quantity, 1 = cost_basis
 }
 
 struct App {
@@ -1222,6 +1223,7 @@ fn handle_input(app: &mut App, key: KeyCode) -> Action {
                         symbol: stock.symbol.clone(),
                         quantity: stock.quantity.to_string(),
                         cost_basis: stock.cost_basis.to_string(),
+                        step: 0,
                     });
                 }
                 Action::None
@@ -1371,6 +1373,10 @@ fn handle_input(app: &mut App, key: KeyCode) -> Action {
                 app.input_mode = InputMode::Normal;
                 Action::None
             }
+            KeyCode::Tab => {
+                state.step = (state.step + 1) % 2;
+                Action::None
+            }
             KeyCode::Enter => {
                 let symbol = state.symbol.clone();
                 let quantity: f64 = state.quantity.parse().unwrap_or(0.0);
@@ -1378,11 +1384,19 @@ fn handle_input(app: &mut App, key: KeyCode) -> Action {
                 Action::EditStock(symbol, quantity, cost_basis)
             }
             KeyCode::Backspace => {
-                state.quantity.pop();
+                let field = match state.step {
+                    0 => &mut state.quantity,
+                    _ => &mut state.cost_basis,
+                };
+                field.pop();
                 Action::None
             }
             KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
-                state.quantity.push(c);
+                let field = match state.step {
+                    0 => &mut state.quantity,
+                    _ => &mut state.cost_basis,
+                };
+                field.push(c);
                 Action::None
             }
             _ => Action::None,
@@ -1961,18 +1975,30 @@ fn render_edit_dialog(f: &mut Frame, state: &EditStockState) {
     let area = centered_rect(40, 30, f.area());
     f.render_widget(Clear, area);
 
+    let (qty_style, cost_style) = if state.step == 0 {
+        (Style::default().fg(Color::Yellow), Style::default())
+    } else {
+        (Style::default(), Style::default().fg(Color::Yellow))
+    };
+
+    let qty_cursor = if state.step == 0 { "█" } else { "" };
+    let cost_cursor = if state.step == 1 { "█" } else { "" };
+
     let lines = vec![
         Line::from(""),
         Line::from(format!("  Editing: {}", state.symbol)),
         Line::from(""),
         Line::from(vec![
             Span::raw("  Quantity: "),
-            Span::styled(format!("{}█", state.quantity), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{}{}", state.quantity, qty_cursor), qty_style),
         ]),
         Line::from(""),
-        Line::from(format!("  Cost basis: {}", state.cost_basis)),
+        Line::from(vec![
+            Span::raw("  Cost basis: "),
+            Span::styled(format!("{}{}", state.cost_basis, cost_cursor), cost_style),
+        ]),
         Line::from(""),
-        Line::from("  Enter=Save, Esc=Cancel").style(Style::default().fg(Color::DarkGray)),
+        Line::from("  Tab=Switch, Enter=Save, Esc=Cancel").style(Style::default().fg(Color::DarkGray)),
     ];
 
     let paragraph = Paragraph::new(lines)
